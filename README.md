@@ -59,3 +59,41 @@ python eval.py --model 'outputs/pdp_20/run_20230413T095145/epoch-49.pt' --decode
 ```
 ## Acknowledgements
 Thanks to [attention-learn-to-route](https://github.com/wouterkool/attention-learn-to-route) for providing the initial codebase for the Attention Model (AM).
+
+---
+
+## 🚀 New Feature: LLM-driven Architecture Search (LLM4HGNAS)
+
+This repository now supports **LLM-driven Graph Neural Network Architecture Search**, allowing GPT-4 to automatically design optimal encoder architectures for the APDP problem during reinforcement learning training.
+
+### Key Features
+- **Dynamic Search Space**: Explores combinations of `Attention`, `GCN`, `GAT`, and `MLP` operators for 7 different heterogeneous relations.
+- **Performance Feedback**: Records training cost of each architecture and feeds "Top 5 Performing Architectures" back to the LLM to guide optimization (Gradient-descent like optimization).
+- **Automated Exploration**: Automatically switches architectures every $K$ epochs.
+
+### Quick Start
+To enable NAS mode with GPT-4:
+
+```bash
+python run.py \
+  --problem pdp \
+  --graph_size 20 \
+  --baseline rollout \
+  --nas_enabled \
+  --nas_arch_generator llm \
+  --llm_model gpt-4 \
+  --llm_api_key "YOUR_OPENAI_API_KEY" \
+  --llm_base_url "https://api.openai.com/v1"
+```
+
+### NAS Arguments
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--nas_enabled` | `False` | Enable dynamic architecture search. |
+| `--nas_arch_generator` | `llm` | Choice between `llm` (GPT-4) or `random` (Random Search). |
+| `--arch_switch_interval` | `10` | Frequency of architecture switching (every N epochs). |
+| `--llm_model` | `gpt-4-0314` | The LLM model name to use. |
+| `--llm_api_key` | `None` | Your OpenAI API Key (or set `OPENAI_API_KEY` env var). |
+
+### Search History
+The architecture search history and performance metrics are saved in `outputs/{problem}_{size}/{run_name}/nas_history.json`.

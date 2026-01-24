@@ -31,13 +31,21 @@ env.bak/
 venv.bak/
 
 # Project specific
+# Project specific
 outputs/
 .claude/
 .idea/
 .vscode/
+.gemini/
 *.log
 
 # User requests
-LLM4HGNAS/
-*.md
-!README.md
+# LLM4HGNAS/ (Code is here now)
+# *.md (Docs are here now)
+result/
+plan.pdf
+
+# Do not upload internal docs
+AGENTS.md
+plan.md
+思路.md
