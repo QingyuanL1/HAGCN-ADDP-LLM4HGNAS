@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 import time
 from datetime import timedelta
 import random
+import json
 
 
 
@@ -24,7 +25,135 @@ mp = torch.multiprocessing.get_context('spawn')
 def get_inner_model(model):
     return model.module if isinstance(model, DataParallel) else model
 
-def load_model(model, device):
+
+def load_architectures(model_path, arch_source='best', top_k=1):
+    """
+    从 nas_history.json 加载架构
+
+    Args:
+        model_path: 模型目录路径
+        arch_source: 'best' 使用最佳架构, 'history' 从历史中选择, 'none' 使用默认
+        top_k: 返回 Top-K 个架构（按 val_cost 排序）
+
+    Returns:
+        list of dict: 架构列表，每个包含 arch, val_cost, source 等信息
+    """
+    nas_history_path = os.path.join(model_path, 'nas_history.json')
+
+    # 向后兼容：文件不存在返回 None
+    if not os.path.exists(nas_history_path):
+        print(f"警告: 未找到 nas_history.json 文件: {nas_history_path}")
+        print("使用默认架构（全注意力）")
+        return [{'arch': None, 'val_cost': None, 'source': 'default'}]
+
+    try:
+        with open(nas_history_path, 'r', encoding='utf-8') as f:
+            nas_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"错误: nas_history.json 格式无效: {e}")
+        return [{'arch': None, 'val_cost': None, 'source': 'default'}]
+
+    architectures = []
+
+    if arch_source == 'best' and 'best' in nas_data:
+        # 使用最佳架构
+        best = nas_data['best']
+        architectures.append({
+            'arch': best['arch'],
+            'val_cost': best.get('val_cost'),
+            'epoch': best.get('epoch'),
+            'source': 'best'
+        })
+    elif 'history' in nas_data:
+        # 从历史中选择 Top-K
+        history = nas_data['history']
+        # 按 val_cost 排序（升序，成本越低越好）
+        sorted_history = sorted(
+            [h for h in history if 'val_cost' in h and h['val_cost'] is not None],
+            key=lambda x: x['val_cost']
+        )
+        for i, entry in enumerate(sorted_history[:top_k]):
+            architectures.append({
+                'arch': entry['arch'],
+                'val_cost': entry.get('val_cost'),
+                'epoch': entry.get('epoch'),
+                'source': f'history_rank_{i+1}'
+            })
+
+    # 如果没有找到有效架构，使用默认
+    if not architectures:
+        print("警告: 未找到有效架构，使用默认架构")
+        return [{'arch': None, 'val_cost': None, 'source': 'default'}]
+
+    return architectures
+
+
+def validate_architecture(arch, n_layers=3, n_relations=7):
+    """
+    验证架构格式是否正确
+
+    Args:
+        arch: 架构（可以是旧格式列表或新格式字典）
+        n_layers: 期望的层数
+        n_relations: 每层的关系数
+
+    Returns:
+        bool: 架构是否有效
+    """
+    if arch is None:
+        return True  # None 表示使用默认架构
+
+    # 新格式：{'layers': [...], 'aggregation': [...]}
+    if isinstance(arch, dict) and 'layers' in arch:
+        layers = arch['layers']
+        if not isinstance(layers, (list, tuple)) or len(layers) != n_layers:
+            print(f"错误: 期望 {n_layers} 层，但得到 {len(layers) if isinstance(layers, (list, tuple)) else 'invalid'}")
+            return False
+
+        for i, layer in enumerate(layers):
+            if not isinstance(layer, (list, tuple)) or len(layer) != n_relations:
+                print(f"错误: 第 {i} 层有 {len(layer) if isinstance(layer, (list, tuple)) else 'invalid'} 个操作，期望 {n_relations}")
+                return False
+            for op in layer:
+                if not (0 <= int(op) <= 4):
+                    print(f"错误: 第 {i} 层中的操作码 {op} 无效")
+                    return False
+
+        if 'aggregation' in arch:
+            agg = arch['aggregation']
+            if len(agg) != n_layers:
+                print(f"错误: 期望 {n_layers} 个聚合方式，但得到 {len(agg)}")
+                return False
+            valid_aggs = {'sum', 'mean', 'max'}
+            for a in agg:
+                if a not in valid_aggs:
+                    print(f"错误: 无效的聚合方式 '{a}'")
+                    return False
+
+        return True
+
+    # 旧格式：[[...], [...], ...]
+    elif isinstance(arch, (list, tuple)):
+        if len(arch) != n_layers:
+            print(f"错误: 期望 {n_layers} 层，但得到 {len(arch)}")
+            return False
+
+        for i, layer in enumerate(arch):
+            if not isinstance(layer, (list, tuple)) or len(layer) != n_relations:
+                print(f"错误: 第 {i} 层有 {len(layer) if isinstance(layer, (list, tuple)) else 'invalid'} 个操作，期望 {n_relations}")
+                return False
+            for op in layer:
+                if not (0 <= int(op) <= 4):
+                    print(f"错误: 第 {i} 层中的操作码 {op} 无效")
+                    return False
+
+        return True
+
+    print(f"错误: 架构必须是字典或列表，但得到 {type(arch)}")
+    return False
+
+
+def load_model(model, device, arch=None):
     model_name = model
     problem = PDP()
     model = AttentionModel(
@@ -38,7 +167,8 @@ def load_model(model, device):
         normalization='batch',
         tanh_clipping=8,
         checkpoint_encoder=False,
-        shrink_size=None
+        shrink_size=None,
+        arch=arch  # 传入架构参数
     )
 
     # Overwrite model parameters by parameters to load
@@ -47,6 +177,10 @@ def load_model(model, device):
     model.load_state_dict({**model.state_dict(), **load_data.get('model', {})})
 
     model, *_ = _load_model_file(model_name, model)
+
+    # 确保架构被设置
+    if arch is not None:
+        model.set_arch(arch)
 
     model.eval()  # Put in eval mode
 
@@ -72,9 +206,9 @@ def get_best(sequences, cost, ids=None, batch_size=None):
 
 
 def eval_dataset_mp(args):
-    (dataset_path, width, softmax_temp, opts, i, num_processes) = args
+    (dataset_path, width, softmax_temp, opts, i, num_processes, arch) = args
 
-    model, _ = load_model(opts.model, opts.device)
+    model, _ = load_model(opts.model, opts.device, arch=arch)
     val_size = opts.val_size // num_processes
     dataset = model.problem.make_dataset(num_samples=val_size,filename=dataset_path, offset=opts.offset + val_size * i)
 
@@ -83,9 +217,9 @@ def eval_dataset_mp(args):
     return _eval_dataset(model, dataset, width, softmax_temp, opts, device)
 
 
-def eval_dataset(dataset_path, width, softmax_temp, opts):
+def eval_dataset(dataset_path, width, softmax_temp, opts, arch=None):
     # load the model
-    model, _ = load_model(opts.model, opts.device)
+    model, _ = load_model(opts.model, opts.device, arch=arch)
     use_cuda = torch.cuda.is_available() and not opts.no_cuda
 
     if opts.multiprocessing:
@@ -97,7 +231,7 @@ def eval_dataset(dataset_path, width, softmax_temp, opts):
         with mp.Pool(num_processes) as pool:
             results = list(itertools.chain.from_iterable(pool.map(
                 eval_dataset_mp,
-                [(dataset_path, width, softmax_temp, opts, i, num_processes) for i in range(num_processes)]
+                [(dataset_path, width, softmax_temp, opts, i, num_processes, arch) for i in range(num_processes)]
             )))
 
     else:
@@ -117,6 +251,73 @@ def eval_dataset(dataset_path, width, softmax_temp, opts):
     print("Calculated total duration: {}".format(timedelta(seconds=int(np.sum(durations) / parallelism))))
 
     return costs, tours, durations
+
+
+def eval_dataset_multi_arch(dataset_path, width, softmax_temp, opts, architectures=None):
+    """
+    评估数据集，支持多架构批量评估
+
+    Args:
+        dataset_path: 数据集路径
+        width: beam width
+        softmax_temp: softmax temperature
+        opts: 命令行参数
+        architectures: 架构列表
+
+    Returns:
+        dict: 每个架构的评估结果
+    """
+    if architectures is None:
+        architectures = [{'arch': None, 'source': 'default'}]
+
+    results = {}
+
+    for arch_info in architectures:
+        arch = arch_info['arch']
+        source = arch_info.get('source', 'unknown')
+
+        print(f"\n{'='*60}")
+        print(f"评估架构: {source}")
+        if arch:
+            if isinstance(arch, dict) and 'layers' in arch:
+                print(f"  Layers: {arch['layers']}")
+                print(f"  Aggregation: {arch.get('aggregation', 'default')}")
+            else:
+                print(f"  Layers: {arch}")
+        else:
+            print("  使用默认架构（全注意力）")
+        print(f"{'='*60}")
+
+        # 验证架构
+        if not validate_architecture(arch):
+            print(f"跳过无效架构: {source}")
+            results[source] = {'error': 'Invalid architecture'}
+            continue
+
+        # 执行评估
+        start_time = time.time()
+        costs, tours, durations = eval_dataset(dataset_path, width, softmax_temp, opts, arch=arch)
+        eval_time = time.time() - start_time
+
+        avg_cost = np.mean(costs)
+        std_cost = np.std(costs)
+
+        results[source] = {
+            'arch': arch,
+            'avg_cost': float(avg_cost),
+            'std_cost': float(std_cost),
+            'min_cost': float(np.min(costs)),
+            'max_cost': float(np.max(costs)),
+            'eval_time': eval_time,
+            'train_val_cost': arch_info.get('val_cost')
+        }
+
+        print(f"\n{source} 的结果:")
+        print(f"  平均成本: {avg_cost:.4f}")
+        print(f"  标准差: {std_cost:.4f}")
+        print(f"  评估时间: {eval_time:.2f}s")
+
+    return results
 
 
 def _eval_dataset(model, dataset, width, softmax_temp, opts, device):
@@ -222,6 +423,16 @@ if __name__ == "__main__":
                         help='Use multiprocessing to parallelize over multiple GPUs')
     parser.add_argument('--graph_size', type=int, default=20, help="The size of the problem graph")
     parser.add_argument('--seed', type=int, default=8888, help='Random seed to use')
+
+    # NAS 架构评估相关参数
+    parser.add_argument('--arch_source', type=str, default='best',
+                        choices=['best', 'history', 'none'],
+                        help="架构来源: 'best' 使用最佳架构, 'history' 从历史中选择 top-k, 'none' 使用默认架构")
+    parser.add_argument('--top_k', type=int, default=1,
+                        help="评估前 K 个架构 (配合 --arch_source history 使用)")
+    parser.add_argument('--save_eval_results', action='store_true',
+                        help="将评估结果保存到 JSON 文件")
+
     opts = parser.parse_args()
 
 
@@ -238,7 +449,58 @@ if __name__ == "__main__":
 
         dataset_path = opts.datasets
 
-        costs, tours, durations = eval_dataset(dataset_path, width, opts.softmax_temperature, opts)
+        # 加载架构
+        model_dir = os.path.dirname(opts.model)
+        if opts.arch_source == 'none':
+            architectures = [{'arch': None, 'source': 'default'}]
+        else:
+            architectures = load_architectures(
+                model_dir,
+                arch_source=opts.arch_source,
+                top_k=opts.top_k
+            )
+
+        print(f"\n加载了 {len(architectures)} 个架构进行评估")
+
+        # 执行多架构评估
+        results = eval_dataset_multi_arch(
+            dataset_path=dataset_path,
+            width=width,
+            softmax_temp=opts.softmax_temperature,
+            opts=opts,
+            architectures=architectures
+        )
+
+        # 输出汇总结果
+        print("\n" + "="*60)
+        print("评估结果汇总")
+        print("="*60)
+
+        sorted_results = sorted(
+            [(k, v) for k, v in results.items() if 'error' not in v],
+            key=lambda x: x[1]['avg_cost']
+        )
+
+        for rank, (source, result) in enumerate(sorted_results, 1):
+            print(f"\n排名 {rank}: {source}")
+            print(f"  平均成本: {result['avg_cost']:.4f}")
+            print(f"  标准差: {result['std_cost']:.4f}")
+            if result.get('train_val_cost'):
+                print(f"  训练验证成本: {result['train_val_cost']:.4f}")
+
+        # 保存结果
+        if opts.save_eval_results:
+            output_path = os.path.join(model_dir, 'eval_results.json')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'model': opts.model,
+                    'dataset': opts.datasets,
+                    'width': width,
+                    'results': results,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                }, f, indent=2, ensure_ascii=False)
+            print(f"\n结果已保存到 {output_path}")
+
 
 
 
