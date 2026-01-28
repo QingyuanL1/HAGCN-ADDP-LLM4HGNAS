@@ -27,6 +27,7 @@ class MultiHeadAttention(nn.Module):
         super(MultiHeadAttention, self).__init__()
 
         self.arch_mask = None
+        self.agg_type = 'sum'
 
         if val_dim is None:
             assert embed_dim is not None, "Provide either embed_dim or val_dim"
@@ -72,8 +73,9 @@ class MultiHeadAttention(nn.Module):
         self.init_parameters()
 
 
-    def set_arch_mask(self, arch_mask):
+    def set_arch_mask(self, arch_mask, agg_type='sum'):
         self.arch_mask = arch_mask
+        self.agg_type = agg_type
 
 
     def init_parameters(self):
@@ -402,36 +404,83 @@ class MultiHeadAttention(nn.Module):
             attnc[mask] = 0
             attn = attnc
 
-        # heads: [n_heads, batrch_size, n_query, val_size],
-        heads = torch.matmul(attn[:, :, :, :graph_size], V)  # V: (self.n_heads, batch_size, graph_size, val_size)
-
-        # heads??pick -> its delivery
-        heads = heads + attn[:, :, :, graph_size].view(self.n_heads, batch_size, graph_size,
-                                                       1) * V_additional_delivery  # V_addi:[n_heads, batch_size, graph_size, key_size]
-
-        # heads??pick -> otherpick, V_allpick: # [n_heads, batch_size, n_pick, key_size]
-        # heads: [n_heads, batch_size, graph_size, key_size]
-        heads = heads + torch.matmul(
-            attn[:, :, :, graph_size + 1:graph_size + 1 + n_pick].view(self.n_heads, batch_size, graph_size, n_pick),
-            V_allpick)
-
-        # V_alldelivery: # (n_heads, batch_size, n_pick, key/val_size)
-        heads = heads + torch.matmul(
-            attn[:, :, :, graph_size + 1 + n_pick:graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size,
-                                                                                    graph_size, n_pick), V_alldelivery)
-
-        # delivery
-        heads = heads + attn[:, :, :, graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size,
-                                                                        1) * V_additional_pick
-
-        heads = heads + torch.matmul(
-            attn[:, :, :, graph_size + 1 + 2 * n_pick + 1:graph_size + 1 + 3 * n_pick + 1].view(self.n_heads,
-                                                                                                batch_size, graph_size,
-                                                                                                n_pick), V_alldelivery2)
-
-        heads = heads + torch.matmul(
-            attn[:, :, :, graph_size + 1 + 3 * n_pick + 1:].view(self.n_heads, batch_size, graph_size, n_pick),
-            V_allpickup2)
+        if self.agg_type == 'mean':
+             # heads is currently a sum of 7 components (plus original V)
+             # This is tricky because the "sum" above is actually 
+             # heads = heads_0 + heads_1 + ...
+             # We want mean(heads_0, heads_1, ...)
+             # But we computed it iteratively.
+             # Wait, the current implementation iteratively adds to `heads`.
+             # To do mean/max properly, we should stack them?
+             # BUT: The architecture allows opting out (zero).
+             # Efficient way: Stack results and aggregate.
+             # Refactoring the iterative add to stacking:
+             components = []
+             
+             # 0. Global
+             components.append(torch.matmul(attn[:, :, :, :graph_size], V))
+             
+             # 1. P->D_pair
+             components.append(attn[:, :, :, graph_size].view(self.n_heads, batch_size, graph_size, 1) * V_additional_delivery)
+             
+             # 2. P->P
+             components.append(torch.matmul(
+                attn[:, :, :, graph_size + 1:graph_size + 1 + n_pick].view(self.n_heads, batch_size, graph_size, n_pick),
+                V_allpick
+             ))
+             
+             # 3. P->D_all
+             components.append(torch.matmul(
+                attn[:, :, :, graph_size + 1 + n_pick:graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size,
+                                                                                        graph_size, n_pick), V_alldelivery))
+                                                                                        
+             # 4. D->P_pair
+             components.append(attn[:, :, :, graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size,
+                                                                            1) * V_additional_pick)
+            
+             # 5. D->D
+             components.append(torch.matmul(
+                attn[:, :, :, graph_size + 1 + 2 * n_pick + 1:graph_size + 1 + 3 * n_pick + 1].view(self.n_heads,
+                                                                                                    batch_size, graph_size,
+                                                                                                    n_pick), V_alldelivery2))
+             
+             # 6. D->P_all
+             components.append(torch.matmul(
+                attn[:, :, :, graph_size + 1 + 3 * n_pick + 1:].view(self.n_heads, batch_size, graph_size, n_pick),
+                V_allpickup2))
+             
+             stacked = torch.stack(components, dim=0) # [7, n_heads, batch, graph, val]
+             heads = stacked.mean(dim=0)
+             
+        elif self.agg_type == 'max':
+             components = []
+             components.append(torch.matmul(attn[:, :, :, :graph_size], V))
+             components.append(attn[:, :, :, graph_size].view(self.n_heads, batch_size, graph_size, 1) * V_additional_delivery)
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1:graph_size + 1 + n_pick].view(self.n_heads, batch_size, graph_size, n_pick), V_allpick))
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + n_pick:graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size, n_pick), V_alldelivery))
+             components.append(attn[:, :, :, graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size, 1) * V_additional_pick)
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + 2 * n_pick + 1:graph_size + 1 + 3 * n_pick + 1].view(self.n_heads, batch_size, graph_size, n_pick), V_alldelivery2))
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + 3 * n_pick + 1:].view(self.n_heads, batch_size, graph_size, n_pick), V_allpickup2))
+             
+             stacked = torch.stack(components, dim=0)
+             heads, _ = stacked.max(dim=0)
+             
+        # Default 'sum' falls through to original behavior (but we need to rewrite it to use components if we want to be clean, or just keep original iterative add for sum as it might be marginally faster/less memory? Stacking is cleaner for maintentance though).
+        # Let's keep original iterative logic for sum for now, or just use stack sum.
+        # However, the iterative logic was modifying `heads` in place.
+        # If I want to support all 3 cleanly, I should replace lines 406-434 with the component logic for ALL cases.
+        else: # 'sum'
+             components = []
+             components.append(torch.matmul(attn[:, :, :, :graph_size], V))
+             components.append(attn[:, :, :, graph_size].view(self.n_heads, batch_size, graph_size, 1) * V_additional_delivery)
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1:graph_size + 1 + n_pick].view(self.n_heads, batch_size, graph_size, n_pick), V_allpick))
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + n_pick:graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size, n_pick), V_alldelivery))
+             components.append(attn[:, :, :, graph_size + 1 + 2 * n_pick].view(self.n_heads, batch_size, graph_size, 1) * V_additional_pick)
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + 2 * n_pick + 1:graph_size + 1 + 3 * n_pick + 1].view(self.n_heads, batch_size, graph_size, n_pick), V_alldelivery2))
+             components.append(torch.matmul(attn[:, :, :, graph_size + 1 + 3 * n_pick + 1:].view(self.n_heads, batch_size, graph_size, n_pick), V_allpickup2))
+             
+             stacked = torch.stack(components, dim=0)
+             heads = stacked.sum(dim=0)
 
 
         #Zi*Wo
@@ -543,15 +592,21 @@ class GraphAttentionEncoder(nn.Module):
             for layer in self.layers:
                 layer[0].module.set_arch_mask(None)
             return
-
-        if isinstance(arch, (list, tuple)) and len(arch) > 0 and isinstance(arch[0], (list, tuple)):
+        
+        # New format: {'layers': [...], 'aggregation': [...]}
+        if isinstance(arch, dict) and 'layers' in arch and 'aggregation' in arch:
+            arch_per_layer = arch['layers']
+            agg_per_layer = arch['aggregation']
+        elif isinstance(arch, (list, tuple)):
+            # Legacy format fallback (assumes sum)
             arch_per_layer = arch
+            agg_per_layer = ['sum'] * len(self.layers)
         else:
-            arch_per_layer = [arch for _ in range(len(self.layers))]
+            raise ValueError("Invalid arch format")
 
-        if len(arch_per_layer) != len(self.layers):
+        if len(arch_per_layer) != len(self.layers) or len(agg_per_layer) != len(self.layers):
             raise ValueError("arch must have per-layer masks matching n_layers")
 
-        for layer, layer_mask in zip(self.layers, arch_per_layer):
-            layer[0].module.set_arch_mask(layer_mask)
+        for layer, layer_mask, agg_type in zip(self.layers, arch_per_layer, agg_per_layer):
+            layer[0].module.set_arch_mask(layer_mask, agg_type)
 

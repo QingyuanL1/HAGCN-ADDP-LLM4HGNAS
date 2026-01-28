@@ -58,19 +58,42 @@ def run(opts):
 
 
     def validate_arch(arch, n_layers):
-        if not isinstance(arch, (list, tuple)) or len(arch) != n_layers:
+        if not isinstance(arch, dict):
+             # Plan B: Backward compatibility or strict check?
+             # Let's enforce new dict format
+             return False
+        
+        layers = arch.get('layers')
+        aggr = arch.get('aggregation')
+        
+        if not isinstance(layers, (list, tuple)) or len(layers) != n_layers:
             return False
-        for layer in arch:
+        
+        if not isinstance(aggr, (list, tuple)) or len(aggr) != n_layers:
+            return False
+
+        for layer in layers:
             if not isinstance(layer, (list, tuple)) or len(layer) != 7:
                 return False
             for v in layer:
                 if int(v) not in (0, 1, 2, 3, 4):
                     return False
+        
+        for a in aggr:
+            if a not in ('sum', 'mean', 'max'):
+                return False
+
         return True
 
 
     def normalize_arch(arch):
-        return [[int(v) for v in layer] for layer in arch]
+        # arch is expected to be a dict now
+        if not isinstance(arch, dict):
+             return arch # Should fail validation
+        
+        layers = [[int(v) for v in layer] for layer in arch['layers']]
+        aggr = [str(a) for a in arch['aggregation']]
+        return {'layers': layers, 'aggregation': aggr}
 
 
     def arch_signature(arch):
@@ -80,7 +103,8 @@ def run(opts):
     def random_arch(n_layers):
         # Sample 0-4.
         # distribution: 0 (30%), 1-4 (random)
-        arch = []
+        layers = []
+        aggr = []
         for _ in range(n_layers):
             layer = []
             for _ in range(7):
@@ -88,30 +112,37 @@ def run(opts):
                     layer.append(0)
                 else:
                     layer.append(random.randint(1, 4))
-            arch.append(layer)
-        return ensure_arch_safe(arch)
+            layers.append(layer)
+            
+            # Sample aggregation
+            aggr.append(random.choice(['sum', 'mean', 'max']))
+            
+        return ensure_arch_safe({'layers': layers, 'aggregation': aggr})
 
 
     def ensure_arch_safe(arch):
         arch = normalize_arch(arch)
-        safe = []
-        for layer in arch:
+        safe_layers = []
+        for layer in arch['layers']:
             layer = [int(v) for v in layer]
             # Always ensure global relation is active (or at least some relation)
             if layer[0] == 0:
                  layer[0] = 1 # Default to Attention
             if sum(layer) == 0:
                  layer[0] = 1
-            safe.append(layer)
-        return safe
+            safe_layers.append(layer)
+        return {'layers': safe_layers, 'aggregation': arch['aggregation']}
 
 
     def extract_first_json_array(text):
         if not isinstance(text, str):
             return None
-        m = re.search(r"\[\s*\[.*?\]\s*\]", text, flags=re.S)
+        # Try finding JSON object first
+        m = re.search(r"\{.*\}", text, flags=re.S)
         if m is None:
-            return None
+             # Fallback to finding array if object not found (though prompt asks for object now, legacy might return array)
+             # But we strictly want object.
+             return None
         try:
             return json.loads(m.group(0))
         except Exception:
@@ -162,20 +193,26 @@ def run(opts):
 
             "Search Space:\n"
             "For each relation type in each layer, select one operation from:\n"
-            "[0: Zero (Mask out), 1: Attention (Standard), 2: GCN (Isotropic), 3: GAT (Additive), 4: MLP (Linear)].\n\n"
+            "[0: Zero (Mask out), 1: Attention (Standard), 2: GCN (Isotropic), 3: GAT (Additive), 4: MLP (Linear)].\n"
+            "Also select an aggregation function for each layer from: ['sum', 'mean', 'max'].\n\n"
 
             "Constraint:\n"
-            "You must output ONLY one JSON array of shape [n_layers, 7].\n"
+            "You must output ONLY one valid JSON object with detailed structure:\n"
+            "{{\n"
+            "  \"layers\": [ [row_1_7_ints], [row_2], ... ],\n"
+            "  \"aggregation\": [ \"agg_layer_1\", \"agg_layer_2\", ... ]\n"
+            "}}\n"
             "n_layers = {}\n"
-            "The 7 positions per layer correspond to relations [1..7] above.\n\n"
+            "The 7 positions per layer correspond to relations [1..7] above.\n"
+            "The aggregation array must have length n_layers.\n\n"
             
             "Performance History (Reference):\n"
             "{}"
             "\n\nInstructions:\n"
-            "1. Analyze the history. If previous architectures (mostly Attention=1) converged poorly or settled, try DIFFERENT operators.\n"
-            "2. AGGRESSIVELY EXPLORE combinations with GCN(2), GAT(3), and MLP(4). These might capture local topology better than global attention.\n"
+            "1. Analyze the history. If previous architectures converged poorly, try DIFFERENT operators OR DIFFERENT AGGREGATION methods (e.g. max or mean).\n"
+            "2. AGGRESSIVELY EXPLORE combinations with GCN(2), GAT(3), and MLP(4).\n"
             "3. Do not simply repeat the best history; iterate on it to find a better structure.\n"
-            "4. Return ONLY the JSON array."
+            "4. Return ONLY the JSON object."
         ).format(n_layers, perf_text)
 
         payload = {
